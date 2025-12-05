@@ -1,23 +1,23 @@
 import http, { IncomingMessage, ServerResponse } from 'http';
 import greeting from "@colyseus/greeting-banner";
 
-import { debugAndPrintError, debugMatchMaking } from './Debug';
-import * as matchMaker from './MatchMaker';
-import { RegisteredHandler } from './matchmaker/RegisteredHandler';
-import { Presence } from './presence/Presence';
+import { debugAndPrintError, debugMatchMaking } from './Debug.js';
+import * as matchMaker from './MatchMaker.js';
+import { RegisteredHandler } from './matchmaker/RegisteredHandler.js';
+import { Presence } from './presence/Presence.js';
 
-import { Room } from './Room';
-import { Type } from './utils/types';
-import { getBearerToken, registerGracefulShutdown } from './utils/Utils';
+import { Room } from './Room.js';
+import { Type } from './utils/types.js';
+import { getBearerToken, registerGracefulShutdown } from './utils/Utils.js';
 
-import { registerNode, unregisterNode} from './discovery';
+import { registerNode, unregisterNode} from './discovery/index.js';
 
-import { LocalPresence } from './presence/LocalPresence';
-import { LocalDriver } from './matchmaker/driver';
+import { LocalPresence } from './presence/LocalPresence.js';
+import { LocalDriver } from './matchmaker/driver/local/LocalDriver.js';
 
-import { Transport } from './Transport';
-import { logger, setLogger } from './Logger';
-import { setDevMode, isDevMode } from './utils/DevMode';
+import { Transport } from './Transport.js';
+import { logger, setLogger } from './Logger.js';
+import { setDevMode, isDevMode } from './utils/DevMode.js';
 
 export type ServerOptions = {
   publicAddress?: string,
@@ -132,7 +132,6 @@ export class Server {
     }
 
     const transport = options.transport || this.getDefaultTransport(options);
-    delete options.transport;
 
     this.transport = transport;
 
@@ -238,7 +237,7 @@ export class Server {
   }
 
   public async gracefullyShutdown(exit: boolean = true, err?: Error) {
-    if (matchMaker.isGracefullyShuttingDown) {
+    if (matchMaker.state === matchMaker.MatchMakerState.SHUTTING_DOWN) {
       return;
     }
 
@@ -248,10 +247,15 @@ export class Server {
     });
 
     try {
+      // custom "before shutdown" method
+      await this.onBeforeShutdownCallback();
+
       await matchMaker.gracefullyShutdown();
       this.transport.shutdown();
       this.presence.shutdown();
       this.driver.shutdown();
+
+      // custom "after shutdown" method
       await this.onShutdownCallback();
 
     } catch (e) {
@@ -301,11 +305,18 @@ export class Server {
     this.onShutdownCallback = callback;
   }
 
+  public onBeforeShutdown(callback: () => void | Promise<any>) {
+    this.onBeforeShutdownCallback = callback;
+  }
+
   protected getDefaultTransport(_: any): Transport {
     throw new Error("Please provide a 'transport' layer. Default transport not set.");
   }
 
   protected onShutdownCallback: () => void | Promise<any> =
+    () => Promise.resolve()
+
+  protected onBeforeShutdownCallback: () => void | Promise<any> =
     () => Promise.resolve()
 
   protected attachMatchMakingRoutes(server: http.Server) {
@@ -327,7 +338,7 @@ export class Server {
 
   protected async handleMatchMakeRequest(req: IncomingMessage, res: ServerResponse) {
     // do not accept matchmaking requests if already shutting down
-    if (matchMaker.isGracefullyShuttingDown) {
+    if (matchMaker.state === matchMaker.MatchMakerState.SHUTTING_DOWN) {
       res.writeHead(503, {});
       res.end();
       return;
@@ -361,8 +372,19 @@ export class Server {
             method,
             roomName,
             clientOptions,
-            { token: getBearerToken(req.headers['authorization']), request: req },
+            {
+              token: getBearerToken(req.headers['authorization']),
+              headers: req.headers,
+              ip: req.headers['x-real-ip'] ?? req.headers['x-forwarded-for'] ?? req.socket.remoteAddress,
+              req,
+            },
           );
+
+          // specify protocol, if available.
+          if (this.transport.protocol !== undefined) {
+            response.protocol = this.transport.protocol;
+          }
+
           res.write(JSON.stringify(response));
 
         } catch (e) {
@@ -373,12 +395,7 @@ export class Server {
       });
 
     } else if (req.method === 'GET') {
-      const matchedParams = req.url.match(matchMaker.controller.allowedRoomNameChars);
-      const roomName = matchedParams.length > 1 ? matchedParams[matchedParams.length - 1] : "";
-
-      headers['Content-Type'] = 'application/json';
-      res.writeHead(200, headers);
-      res.write(JSON.stringify(await matchMaker.controller.getAvailableRooms(roomName)));
+      res.writeHead(404, headers);
       res.end();
     }
 

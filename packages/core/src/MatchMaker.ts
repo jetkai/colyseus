@@ -1,43 +1,45 @@
-import { ErrorCode, Protocol } from './Protocol';
+import { EventEmitter } from 'events';
+import { ErrorCode, Protocol } from './Protocol.js';
 
-import { requestFromIPC, subscribeIPC } from './IPC';
+import { requestFromIPC, subscribeIPC, subscribeWithTimeout } from './IPC.js';
 
-import { Deferred, generateId, merge, REMOTE_ROOM_SHORT_TIMEOUT, retry } from './utils/Utils';
-import { isDevMode, cacheRoomHistory, getPreviousProcessId, getRoomRestoreListKey, reloadFromCache } from './utils/DevMode';
+import { Deferred, generateId, merge, retry, MAX_CONCURRENT_CREATE_ROOM_WAIT_TIME, REMOTE_ROOM_SHORT_TIMEOUT } from './utils/Utils.js';
+import { isDevMode, cacheRoomHistory, getPreviousProcessId, getRoomRestoreListKey, reloadFromCache } from './utils/DevMode.js';
 
-import { RegisteredHandler } from './matchmaker/RegisteredHandler';
-import { Room, RoomInternalState } from './Room';
+import { RegisteredHandler } from './matchmaker/RegisteredHandler.js';
+import { Room, RoomInternalState } from './Room.js';
 
-import { LocalPresence } from './presence/LocalPresence';
-import { Presence } from './presence/Presence';
+import { LocalPresence } from './presence/LocalPresence.js';
+import { Presence } from './presence/Presence.js';
 
-import { debugAndPrintError, debugMatchMaking } from './Debug';
-import { SeatReservationError } from './errors/SeatReservationError';
-import { ServerError } from './errors/ServerError';
+import { debugAndPrintError, debugMatchMaking } from './Debug.js';
+import { SeatReservationError } from './errors/SeatReservationError.js';
+import { ServerError } from './errors/ServerError.js';
 
-import { IRoomListingData, RoomListingData, LocalDriver, MatchMakerDriver } from './matchmaker/driver';
-import controller from './matchmaker/controller';
-import * as stats from "./Stats";
+import { IRoomCache, LocalDriver, MatchMakerDriver, SortOptions } from './matchmaker/driver/local/LocalDriver.js';
+import controller from './matchmaker/controller.js';
+import * as stats from './Stats.js';
 
-import { logger } from './Logger';
-import { Client } from './Transport';
-import { Type } from './utils/types';
-import { getHostname } from "./discovery";
+import { logger } from './Logger.js';
+import { AuthContext, Client } from './Transport.js';
+import { Type } from './utils/types.js';
+import { getHostname } from './discovery/index.js';
+import { getLockId } from './matchmaker/driver/api.js';
 
 export { controller, stats, type MatchMakerDriver };
 
 export type ClientOptions = any;
-export type AuthOptions = { token?: string, request?: any };
 export type SelectProcessIdCallback = (roomName: string, clientOptions: ClientOptions) => Promise<string>;
 
 export interface SeatReservation {
   sessionId: string;
-  room: RoomListingData;
+  room: IRoomCache;
   devMode?: boolean;
 }
 
 const handlers: {[id: string]: RegisteredHandler} = {};
 const rooms: {[roomId: string]: Room} = {};
+const events = new EventEmitter();
 
 export let publicAddress: string;
 export let processId: string;
@@ -58,7 +60,6 @@ export function setHealthChecksEnabled(value: boolean) {
   enableHealthChecks = value;
 }
 
-export let isGracefullyShuttingDown: boolean; // TODO: remove me on 1.0, use 'state' instead
 export let onReady: Deferred = new Deferred(); // onReady needs to be immediately available to @colyseus/auth integration.
 
 export enum MatchMakerState {
@@ -89,7 +90,6 @@ export async function setup(
     onReady = new Deferred();
   }
 
-  isGracefullyShuttingDown = false;
   state = MatchMakerState.INITIALIZING;
 
   presence = _presence || new LocalPresence();
@@ -130,7 +130,7 @@ export async function accept() {
    * - handle remote process healthcheck
    * - handle remote room creation
    */
-  await subscribeIPC(presence, processId, getProcessChannel(), (method, args) => {
+  await subscribeIPC(presence, getProcessChannel(), (method, args) => {
     if (method === 'healthcheck') {
       // health check for this processId
       return true;
@@ -146,6 +146,14 @@ export async function accept() {
    */
   if (enableHealthChecks) {
     await healthCheckAllProcesses();
+
+    /*
+     * persist processId every 1 minute
+     *
+     * FIXME: this is a workaround in case this `processId` gets excluded
+     * (`stats.excludeProcess()`) by mistake due to health-check failure
+     */
+    stats.setAutoPersistInterval();
   }
 
   state = MatchMakerState.READY;
@@ -160,19 +168,43 @@ export async function accept() {
 /**
  * Join or create into a room and return seat reservation
  */
-export async function joinOrCreate(roomName: string, clientOptions: ClientOptions = {}, authOptions?: AuthOptions) {
+export async function joinOrCreate(roomName: string, clientOptions: ClientOptions = {}, authContext?: AuthContext) {
   return await retry<Promise<SeatReservation>>(async () => {
-    const authData = await callOnAuth(roomName, authOptions);
-    let room = await findOneRoomAvailable(roomName, clientOptions);
-
-    //
-    // TODO [?]
-    //    should we expose the "creator" auth data of the room during `onCreate()`?
-    //    it would be useful, though it could be accessed via `onJoin()` for now.
-    //
+    const authData = await callOnAuth(roomName, clientOptions, authContext);
+    let room: IRoomCache = await findOneRoomAvailable(roomName, clientOptions);
 
     if (!room) {
-      room = await createRoom(roomName, clientOptions);
+      const handler = getHandler(roomName);
+      const filterOptions = handler.getFilterOptions(clientOptions);
+      const concurrencyKey = getLockId(filterOptions);
+
+      //
+      // Prevent multiple rooms of same filter from being created concurrently
+      //
+      await concurrentJoinOrCreateRoomLock(handler, concurrencyKey, async (roomId?: string) => {
+        if (roomId) {
+          room = await driver.findOne({ roomId })
+        }
+
+        // If the room is not found or is already locked, try to find a new one
+        if (!room || room.locked) {
+          room = await findOneRoomAvailable(roomName, clientOptions);
+        }
+
+        if (!room) {
+          //
+          // TODO [?]
+          //    should we expose the "creator" auth data of the room during `onCreate()`?
+          //    it would be useful, though it could be accessed via `onJoin()` for now.
+          //
+          room = await createRoom(roomName, clientOptions);
+
+          // Notify waiting concurrent requests about the new room
+          presence.publish(`concurrent:${handler.name}:${concurrencyKey}`, room.roomId);
+        }
+
+        return room;
+      });
     }
 
     return await reserveSeatFor(room, clientOptions, authData);
@@ -182,8 +214,8 @@ export async function joinOrCreate(roomName: string, clientOptions: ClientOption
 /**
  * Create a room and return seat reservation
  */
-export async function create(roomName: string, clientOptions: ClientOptions = {}, authOptions?: AuthOptions) {
-  const authData = await callOnAuth(roomName, authOptions);
+export async function create(roomName: string, clientOptions: ClientOptions = {}, authContext?: AuthContext) {
+  const authData = await callOnAuth(roomName, clientOptions, authContext);
   const room = await createRoom(roomName, clientOptions);
   return reserveSeatFor(room, clientOptions, authData);
 }
@@ -191,9 +223,9 @@ export async function create(roomName: string, clientOptions: ClientOptions = {}
 /**
  * Join a room and return seat reservation
  */
-export async function join(roomName: string, clientOptions: ClientOptions = {}, authOptions?: AuthOptions) {
+export async function join(roomName: string, clientOptions: ClientOptions = {}, authContext?: AuthContext) {
   return await retry<Promise<SeatReservation>>(async () => {
-    const authData = await callOnAuth(roomName, authOptions);
+    const authData = await callOnAuth(roomName, clientOptions, authContext);
     const room = await findOneRoomAvailable(roomName, clientOptions);
 
     if (!room) {
@@ -212,7 +244,7 @@ export async function reconnect(roomId: string, clientOptions: ClientOptions = {
   if (!room) {
     // TODO: support a "logLevel" out of the box?
     if (process.env.NODE_ENV !== 'production') {
-      logger.info(`❌ room "${roomId}" has been disposed. Did you missed .allowReconnection()?\n👉 https://docs.colyseus.io/server/room/#allowreconnection-client-seconds`);
+      logger.info(`❌ room "${roomId}" has been disposed. Did you miss .allowReconnection()?\n👉 https://docs.colyseus.io/server/room/#allowreconnection-client-seconds`);
     }
 
     throw new ServerError(ErrorCode.MATCHMAKE_INVALID_ROOM_ID, `room "${roomId}" has been disposed.`);
@@ -231,7 +263,7 @@ export async function reconnect(roomId: string, clientOptions: ClientOptions = {
   } else {
     // TODO: support a "logLevel" out of the box?
     if (process.env.NODE_ENV !== 'production') {
-      logger.info(`❌ reconnection token invalid or expired. Did you missed .allowReconnection()?\n👉 https://docs.colyseus.io/server/room/#allowreconnection-client-seconds`);
+      logger.info(`❌ reconnection token invalid or expired. Did you miss .allowReconnection()?\n👉 https://docs.colyseus.io/server/room/#allowreconnection-client-seconds`);
     }
     throw new ServerError(ErrorCode.MATCHMAKE_EXPIRED, `reconnection token invalid or expired.`);
   }
@@ -242,11 +274,11 @@ export async function reconnect(roomId: string, clientOptions: ClientOptions = {
  *
  * @param roomId - The Id of the specific room instance.
  * @param clientOptions - Options for the client seat reservation (for `onJoin`/`onAuth`)
- * @param authOptions - Optional authentication token
+ * @param authContext - Optional authentication token
  *
- * @returns Promise<SeatReservation> - A promise which contains `sessionId` and `RoomListingData`.
+ * @returns Promise<SeatReservation> - A promise which contains `sessionId` and `IRoomCache`.
  */
-export async function joinById(roomId: string, clientOptions: ClientOptions = {}, authOptions?: AuthOptions) {
+export async function joinById(roomId: string, clientOptions: ClientOptions = {}, authContext?: AuthContext) {
   const room = await driver.findOne({ roomId });
 
   if (!room) {
@@ -256,7 +288,7 @@ export async function joinById(roomId: string, clientOptions: ClientOptions = {}
     throw new ServerError(ErrorCode.MATCHMAKE_INVALID_ROOM_ID, `room "${roomId}" is locked`);
   }
 
-  const authData = await callOnAuth(room.name, authOptions);
+  const authData = await callOnAuth(room.name, clientOptions, authContext);
 
   return reserveSeatFor(room, clientOptions, authData);
 }
@@ -264,35 +296,37 @@ export async function joinById(roomId: string, clientOptions: ClientOptions = {}
 /**
  * Perform a query for all cached rooms
  */
-export async function query(conditions: Partial<IRoomListingData> = {}) {
-  return await driver.find(conditions);
+export async function query(conditions: Partial<IRoomCache> = {}, sortOptions?: SortOptions) {
+  return await driver.query(conditions, sortOptions);
 }
 
 /**
  * Find for a public and unlocked room available.
  *
  * @param roomName - The Id of the specific room.
- * @param clientOptions - Options for the client seat reservation (for `onJoin`/`onAuth`).
+ * @param filterOptions - Filter options.
+ * @param sortOptions - Sorting options.
  *
- * @returns Promise<RoomListingData> - A promise contaning an object which includes room metadata and configurations.
+ * @returns Promise<IRoomCache> - A promise contaning an object which includes room metadata and configurations.
  */
-export async function findOneRoomAvailable(roomName: string, clientOptions: ClientOptions): Promise<RoomListingData> {
-  return await awaitRoomAvailable(roomName, async () => {
-    const handler = getHandler(roomName);
+export async function findOneRoomAvailable(
+  roomName: string,
+  filterOptions: ClientOptions,
+  additionalSortOptions?: SortOptions,
+) {
+  const handler = getHandler(roomName);
+  const sortOptions = Object.assign({}, handler.sortOptions ?? {});
 
-    const roomQuery = driver.findOne({
-      locked: false,
-      name: roomName,
-      private: false,
-      ...handler.getFilterOptions(clientOptions),
-    });
+  if (additionalSortOptions) {
+    Object.assign(sortOptions, additionalSortOptions);
+  }
 
-    if (handler.sortOptions) {
-      roomQuery.sort(handler.sortOptions);
-    }
-
-    return await roomQuery;
-  });
+  return await driver.findOne({
+    locked: false,
+    name: roomName,
+    private: false,
+    ...handler.getFilterOptions(filterOptions),
+  }, sortOptions);
 }
 
 /**
@@ -348,7 +382,7 @@ export function defineRoomType<T extends Type<Room>>(
   klass: T,
   defaultOptions?: Parameters<NonNullable<InstanceType<T>['onCreate']>>[0],
 ) {
-  const registeredHandler = new RegisteredHandler(klass, defaultOptions);
+  const registeredHandler = new RegisteredHandler(roomName, klass, defaultOptions);
 
   handlers[roomName] = registeredHandler;
 
@@ -361,19 +395,11 @@ export function defineRoomType<T extends Type<Room>>(
     }
   }
 
-  if (!isDevMode) {
-    cleanupStaleRooms(roomName);
-  }
-
   return registeredHandler;
 }
 
 export function removeRoomType(roomName: string) {
   delete handlers[roomName];
-
-  if (!isDevMode) {
-    cleanupStaleRooms(roomName);
-  }
 }
 
 // TODO: legacy; remove me on 1.0
@@ -403,9 +429,9 @@ export function getRoomClass(roomName: string): Type<Room> {
  * @param roomName - The identifier you defined on `gameServer.define()`
  * @param clientOptions - Options for `onCreate`
  *
- * @returns Promise<RoomListingData> - A promise contaning an object which includes room metadata and configurations.
+ * @returns Promise<IRoomCache> - A promise contaning an object which includes room metadata and configurations.
  */
-export async function createRoom(roomName: string, clientOptions: ClientOptions): Promise<RoomListingData> {
+export async function createRoom(roomName: string, clientOptions: ClientOptions): Promise<IRoomCache> {
   //
   // - select a process to create the room
   // - use local processId if MatchMaker is not ready yet
@@ -414,9 +440,23 @@ export async function createRoom(roomName: string, clientOptions: ClientOptions)
     ? await selectProcessIdToCreateRoom(roomName, clientOptions)
     : processId;
 
-  let room: RoomListingData;
+  let room: IRoomCache;
   if (selectedProcessId === undefined) {
-    throw new ServerError(ErrorCode.MATCHMAKE_UNHANDLED, `no processId available to create room ${roomName}`);
+
+    if (isDevMode && processId === undefined) {
+      //
+      // WORKAROUND: wait for processId to be available
+      // TODO: Remove this check on 1.0
+      //
+      // - This is a workaround when using matchMaker.createRoom() before the processId is available.
+      // - We need to use top-level await to retrieve processId
+      //
+      await onReady;
+      return createRoom(roomName, clientOptions);
+
+    } else {
+      throw new ServerError(ErrorCode.MATCHMAKE_UNHANDLED, `no processId available to create room ${roomName}`);
+    }
 
   } else if (selectedProcessId === processId) {
     // create the room on this process!
@@ -425,7 +465,7 @@ export async function createRoom(roomName: string, clientOptions: ClientOptions)
   } else {
     // ask other process to create the room!
     try {
-      room = await requestFromIPC<RoomListingData>(
+      room = await requestFromIPC<IRoomCache>(
         presence,
         getProcessChannel(selectedProcessId),
         undefined,
@@ -467,7 +507,7 @@ export async function createRoom(roomName: string, clientOptions: ClientOptions)
   return room;
 }
 
-export async function handleCreateRoom(roomName: string, clientOptions: ClientOptions, restoringRoomId?: string): Promise<RoomListingData> {
+export async function handleCreateRoom(roomName: string, clientOptions: ClientOptions, restoringRoomId?: string): Promise<IRoomCache> {
   const handler = getHandler(roomName);
   const room = new handler.klass();
 
@@ -478,6 +518,15 @@ export async function handleCreateRoom(roomName: string, clientOptions: ClientOp
   } else {
     room.roomId = generateId();
   }
+
+  //
+  // Initialize .state (if set).
+  //
+  // Define getters and setters for:
+  //   - autoDispose
+  //   - patchRate
+  //
+  room['__init']();
 
   room.roomName = roomName;
   room.presence = presence;
@@ -534,18 +583,41 @@ export async function handleCreateRoom(roomName: string, clientOptions: ClientOp
     room._events.removeAllListeners('unlock');
     room._events.removeAllListeners('visibility-change');
     room._events.removeAllListeners('dispose');
+
+    //
+    // emit "no active rooms" event when there are no more rooms in this process
+    // (used during graceful shutdown)
+    //
+    if (stats.local.roomCount <= 0) {
+      events.emit('no-active-rooms');
+    }
   });
 
   // room always start unlocked
   await createRoomReferences(room, true);
-  await room.listing.save();
+
+  // persist room data only if match-making is enabled
+  if (state !== MatchMakerState.SHUTTING_DOWN) {
+    await room.listing.save();
+  }
 
   handler.emit('create', room);
 
   return room.listing;
 }
 
+/**
+ * Get room data by roomId.
+ * This method does not return the actual room instance, use `getLocalRoomById` for that.
+ */
 export function getRoomById(roomId: string) {
+  return driver.findOne({ roomId });
+}
+
+/**
+ * Get local room instance by roomId. (Can return "undefined" if the room is not available on this process)
+ */
+export function getLocalRoomById(roomId: string) {
   return rooms[roomId];
 }
 
@@ -560,42 +632,75 @@ export function disconnectAll(closeCode?: number) {
       continue;
     }
 
-    const room = rooms[roomId];
-
-    // prevent touching stats when process is shutting down
-    room._events.removeAllListeners("leave");
-
-    promises.push(room.disconnect(closeCode));
+    promises.push(rooms[roomId].disconnect(closeCode));
   }
 
   return promises;
 }
 
+async function lockAndDisposeAll(): Promise<any> {
+  // remove processId from room count key
+  // (stops accepting new rooms on this process)
+  await stats.excludeProcess(processId);
+
+  // clear auto-persisting stats interval
+  if (enableHealthChecks) {
+    stats.clearAutoPersistInterval();
+  }
+
+  const noActiveRooms = new Deferred();
+  if (stats.local.roomCount <= 0) {
+    // no active rooms to dispose
+    noActiveRooms.resolve();
+
+  } else {
+    // wait for all rooms to be disposed
+    // TODO: set generous timeout in case
+    events.once('no-active-rooms', () => noActiveRooms.resolve());
+  }
+
+  // - lock all local rooms to prevent new joins
+  // - trigger `onBeforeShutdown()` on each room
+  for (const roomId in rooms) {
+    if (!rooms.hasOwnProperty(roomId)) {
+      continue;
+    }
+
+    const room = rooms[roomId];
+    room.lock();
+    room.onBeforeShutdown();
+  }
+
+  await noActiveRooms;
+}
+
 export async function gracefullyShutdown(): Promise<any> {
-  if (isGracefullyShuttingDown) {
+  if (state === MatchMakerState.SHUTTING_DOWN) {
     return Promise.reject('already_shutting_down');
   }
 
-  isGracefullyShuttingDown = true;
+  debugMatchMaking(`${processId} is shutting down!`);
+
   state = MatchMakerState.SHUTTING_DOWN;
 
   onReady = undefined;
 
-  debugMatchMaking(`${processId} is shutting down!`);
+  // - lock existing rooms
+  // - stop accepting new rooms on this process
+  // - wait for all rooms to be disposed
+  await lockAndDisposeAll();
 
   if (isDevMode) {
     await cacheRoomHistory(rooms);
   }
 
-  // remove processId from room count key
-  await stats.excludeProcess(processId);
-
-  // remove cached rooms of this process
+  // make sure rooms are removed from cache
   await removeRoomsByProcessId(processId);
 
   // unsubscribe from process id channel
   presence.unsubscribe(getProcessChannel());
 
+  // make sure all rooms are disposed
   return Promise.all(disconnectAll(
     (isDevMode)
       ? Protocol.WS_CLOSE_DEVMODE_RESTART
@@ -606,8 +711,8 @@ export async function gracefullyShutdown(): Promise<any> {
 /**
  * Reserve a seat for a client in a room
  */
-export async function reserveSeatFor(room: RoomListingData, options: ClientOptions, authData?: any) {
-  const sessionId: string = generateId();
+export async function reserveSeatFor(room: IRoomCache, options: ClientOptions, authData?: any) {
+  const sessionId: string = authData?.sessionId || generateId();
 
   debugMatchMaking(
     'reserving seat. sessionId: \'%s\', roomId: \'%s\', processId: \'%s\'',
@@ -659,16 +764,15 @@ export async function reserveSeatFor(room: RoomListingData, options: ClientOptio
   return response;
 }
 
-function callOnAuth(roomName: string, authOptions?: AuthOptions) {
+async function callOnAuth(roomName: string, clientOptions?: ClientOptions, authContext?: AuthContext) {
   const roomClass = getRoomClass(roomName);
-  return (roomClass && roomClass['onAuth'] && roomClass['onAuth'] !== Room['onAuth'])
-    ? roomClass['onAuth'](authOptions.token, authOptions.request)
-    : undefined;
-}
-
-export async function cleanupStaleRooms(roomName: string) {
-  // remove connecting counts
-  await presence.del(getHandlerConcurrencyKey(roomName));
+  if (roomClass && roomClass['onAuth'] && roomClass['onAuth'] !== Room['onAuth']) {
+    const result = await roomClass['onAuth'](authContext.token, clientOptions, authContext)
+    if (!result) {
+      throw new ServerError(ErrorCode.AUTH_FAILED, 'onAuth failed');
+    }
+    return result;
+  }
 }
 
 /**
@@ -676,10 +780,18 @@ export async function cleanupStaleRooms(roomName: string) {
  */
 export async function healthCheckAllProcesses() {
   const allStats = await stats.fetchAll();
+
+  const activeProcessChannels = (typeof(presence.channels) === "function") // TODO: remove this check on 0.17
+    ? (await presence.channels("p:*")).map(c => c.substring(2))
+    : [];
+
   if (allStats.length > 0) {
     await Promise.all(
       allStats
-        .filter(stat => stat.processId !== processId) // skip current process
+        .filter(stat => (
+          stat.processId !== processId && // skip current process
+          !activeProcessChannels.includes(stat.processId) // skip if channel is still listening
+        ))
         .map(stat => healthCheckProcessId(stat.processId))
     );
   }
@@ -705,7 +817,7 @@ export function healthCheckProcessId(processId: string) {
     try {
       const requestTime = Date.now();
 
-      await requestFromIPC<RoomListingData>(
+      await requestFromIPC<IRoomCache>(
         presence,
         getProcessChannel(processId),
         'healthcheck',
@@ -746,20 +858,7 @@ async function removeRoomsByProcessId(processId: string) {
   // clean-up possibly stale room ids
   // (ungraceful shutdowns using Redis can result on stale room ids still on memory.)
   //
-  if (typeof(driver.cleanup) === "function") {
-    await driver.cleanup(processId);
-
-  } else {
-    //
-    // TODO: remove this block on 1.0.
-    //
-    //  driver.cleanup() has been added mid-way through 0.15
-    //  some users may still be using older versions of the driver.
-    //
-    const cachedRooms = await driver.find({ processId }, { _id: 1 });
-    logger.debug("> Removing stale rooms by processId:", processId, `(${cachedRooms.length} rooms found)`);
-    cachedRooms.forEach((room) => room.remove());
-  }
+  await driver.cleanup(processId);
 }
 
 async function createRoomReferences(room: Room, init: boolean = false): Promise<boolean> {
@@ -768,7 +867,6 @@ async function createRoomReferences(room: Room, init: boolean = false): Promise<
   if (init) {
     await subscribeIPC(
       presence,
-      processId,
       getRoomChannel(room.roomId),
       (method, args) => {
         return (!args && typeof (room[method]) !== 'function')
@@ -781,38 +879,56 @@ async function createRoomReferences(room: Room, init: boolean = false): Promise<
   return true;
 }
 
-async function awaitRoomAvailable(roomToJoin: string, callback: Function): Promise<RoomListingData> {
+/**
+ * Used only during `joinOrCreate` to handle concurrent requests for creating a room.
+ */
+async function concurrentJoinOrCreateRoomLock(
+  handler: RegisteredHandler,
+  concurrencyKey: string,
+  callback: (roomId?: string) => Promise<IRoomCache>
+): Promise<IRoomCache> {
   return new Promise(async (resolve, reject) => {
-    const concurrencyKey = getHandlerConcurrencyKey(roomToJoin);
-    const concurrency = await presence.incr(concurrencyKey) - 1;
+    const hkey = getConcurrencyHashKey(handler.name);
+    const concurrency = await presence.hincrbyex(
+      hkey,
+      concurrencyKey,
+      1, // increment by 1
+      MAX_CONCURRENT_CREATE_ROOM_WAIT_TIME * 2 // expire in 2x the time of MAX_CONCURRENT_CREATE_ROOM_WAIT_TIME
+    ) - 1; // do not consider the current request
 
-    //
-    // avoid having too long timeout if 10+ clients ask to join at the same time
-    //
-    // TODO: we need a better solution here. either a lock or queue system should be implemented instead.
-    // https://github.com/colyseus/colyseus/issues/466
-    //
-    const concurrencyTimeout = Math.min(concurrency * 100, 500);
-
-    if (concurrency > 0) {
-      debugMatchMaking(
-        'receiving %d concurrent requests for joining \'%s\' (waiting %d ms)',
-        concurrency, roomToJoin, concurrencyTimeout,
-      );
-    }
-
-    setTimeout(async () => {
+    const fulfill = async (roomId?: string) => {
       try {
-        const result = await callback();
-        resolve(result);
+        resolve(await callback(roomId));
 
       } catch (e) {
         reject(e);
 
       } finally {
-        await presence.decr(concurrencyKey);
+        await presence.hincrbyex(hkey, concurrencyKey, -1, MAX_CONCURRENT_CREATE_ROOM_WAIT_TIME * 2);
       }
-    }, concurrencyTimeout);
+    };
+
+    if (concurrency > 0) {
+      debugMatchMaking(
+        'receiving %d concurrent joinOrCreate for \'%s\' (%s)',
+        concurrency, handler.name, concurrencyKey
+      );
+
+      try {
+        const roomId = await subscribeWithTimeout(
+          presence,
+          `concurrent:${handler.name}:${concurrencyKey}`,
+          (MAX_CONCURRENT_CREATE_ROOM_WAIT_TIME +
+            (Math.min(concurrency, 3) * 0.2)) * 1000 // convert to milliseconds
+        );
+
+        return await fulfill(roomId);
+      } catch (error) {
+        // Ignore ipc_timeout error
+      }
+    }
+
+    return await fulfill();
   });
 }
 
@@ -849,7 +965,7 @@ function onVisibilityChange(room: Room, isInvisible: boolean): void {
 }
 
 async function disposeRoom(roomName: string, room: Room) {
-  debugMatchMaking('disposing \'%s\' (%s) on processId \'%s\' (graceful shutdown: %s)', roomName, room.roomId, processId, isGracefullyShuttingDown);
+  debugMatchMaking('disposing \'%s\' (%s) on processId \'%s\' (graceful shutdown: %s)', roomName, room.roomId, processId, state === MatchMakerState.SHUTTING_DOWN);
 
   //
   // FIXME: this call should not be necessary.
@@ -860,10 +976,10 @@ async function disposeRoom(roomName: string, room: Room) {
   // non-existing rooms)
   //
   room.listing.remove();
+  stats.local.roomCount--;
 
   // decrease amount of rooms this process is handling
-  if (!isGracefullyShuttingDown) {
-    stats.local.roomCount--;
+  if (state !== MatchMakerState.SHUTTING_DOWN) {
     stats.persist();
 
     // remove from devMode restore list
@@ -874,9 +990,6 @@ async function disposeRoom(roomName: string, room: Room) {
 
   // emit disposal on registered session handler
   handlers[roomName].emit('dispose', room);
-
-  // remove concurrency key
-  presence.del(getHandlerConcurrencyKey(roomName));
 
   // unsubscribe from remote connections
   presence.unsubscribe(getRoomChannel(room.roomId));
@@ -892,8 +1005,9 @@ function getRoomChannel(roomId: string) {
   return `$${roomId}`;
 }
 
-function getHandlerConcurrencyKey(name: string) {
-  return `c:${name}`;
+function getConcurrencyHashKey(roomName: string) {
+  // concurrency hash
+  return `ch:${roomName}`;
 }
 
 function getProcessChannel(id: string = processId) {

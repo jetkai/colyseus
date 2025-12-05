@@ -63,6 +63,7 @@ async function main() {
         skipLibCheck: true,
         module: ts.ModuleKind.CommonJS,
         target: ts.ScriptTarget.ES2015,
+        lib: ["lib.es2022.d.ts"],
         outDir: outdir,
         downlevelIteration: true, // (redis-driver)
         esModuleInterop: true,
@@ -92,7 +93,6 @@ async function main() {
       format: "cjs",
       sourcemap: "external",
       platform: "node",
-      watch: argv.watch,
     });
 
     // ESM output
@@ -100,16 +100,19 @@ async function main() {
       entryPoints: entrypoints,
       outdir,
       format: "esm",
+      bundle: true,
       sourcemap: "external",
       platform: "node",
       outExtension: { '.js': '.mjs', },
-      watch: argv.watch && {
-        onRebuild(err, result) {
-          if (err) { return console.error(err); }
-          // re-emit .d.ts files
-          emitTSDeclaration();
-        }
+      plugins: [{
+        name: 'add-mjs',
+        setup(build) {
+          build.onResolve({ filter: /.*/ }, (args) => {
+            if (args.importer) return { path: args.path.replace(/^\.(.*)\.js$/, '.$1.mjs'), external: true }
+          })
+        },
       },
+      ],
     });
 
     // emit .d.ts files

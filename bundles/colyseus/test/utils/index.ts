@@ -1,9 +1,9 @@
 import WebSocket from "ws";
 import { EventEmitter } from "events";
 
-import { pack, unpack } from "msgpackr";
+import { pack, unpack } from "@colyseus/msgpackr";
 
-import { Server, ServerOptions, Room, matchMaker, LocalDriver, ClientState, LocalPresence, Protocol, Presence, Client, Deferred, ISendOptions, getMessageBytes } from "@colyseus/core";
+import { Server, ServerOptions, Room, matchMaker, LocalDriver, ClientState, LocalPresence, Protocol, Presence, Client, Deferred, ISendOptions, getMessageBytes, ClientPrivate } from "@colyseus/core";
 import { RedisPresence } from "@colyseus/redis-presence";
 import { RedisDriver } from "@colyseus/redis-driver";
 
@@ -18,14 +18,14 @@ Server.prototype['getDefaultTransport'] = function (options: ServerOptions) {
   });
 }
 
-export const DRIVERS = [ LocalDriver, ];
+// export const DRIVERS = [ LocalDriver, ];
 export const PRESENCE_IMPLEMENTATIONS = [ LocalPresence, ];
 
-// export const DRIVERS = [
-//   // LocalDriver,
-//   RedisDriver,
-//   // MongooseDriver,
-// ];
+export const DRIVERS = [
+  LocalDriver,
+  // RedisDriver,
+  // MongooseDriver,
+];
 
 // export const PRESENCE_IMPLEMENTATIONS = [
 //   // LocalPresence,
@@ -36,7 +36,7 @@ export class RawClient extends EventEmitter {
   readyState: number = WebSocket.OPEN;
 }
 
-export class WebSocketClient implements Client {
+export class WebSocketClient implements Client, ClientPrivate {
   id: string;
   sessionId: string;
   ref: RawClient;
@@ -45,7 +45,8 @@ export class WebSocketClient implements Client {
   messages: any[] = [];
   _enqueuedMessages: any[] = [];
   _afterNextPatchQueue;
-  _reconnectionToken;
+  _joinedAt: number;
+  reconnectionToken;
 
   errors: any[] = [];
 
@@ -85,7 +86,7 @@ export class WebSocketClient implements Client {
   }
 
   async confirmJoinRoom(room: Room) {
-    await room._onJoin(this);
+    await room._onJoin(this, { headers: {}, ip: "127.0.0.1" });
 
     //
     // this simulates when the client-side has sent the `Protocol.JOIN_ROOM` message

@@ -3,10 +3,11 @@
  * (for interoperability between different http frameworks, e.g. express, uWebSockets.js, etc)
  */
 
-import { IncomingMessage } from "http";
-import { ErrorCode } from "../Protocol";
-import { ServerError } from "../errors/ServerError";
-import * as matchMaker from "../MatchMaker";
+import { IncomingMessage } from 'http';
+import { ErrorCode } from '../Protocol.js';
+import { ServerError } from '../errors/ServerError.js';
+import * as matchMaker from '../MatchMaker.js';
+import type { AuthContext } from '../Transport.js';
 
 export default {
   DEFAULT_CORS_HEADERS: {
@@ -43,25 +44,11 @@ export default {
     };
   },
 
-  getAvailableRooms(roomName: string) {
-    /**
-     * list public & unlocked rooms
-     */
-    const conditions: any = {
-      locked: false,
-      private: false,
-    };
-    if (roomName) {
-      conditions["name"] = roomName;
-    }
-    return matchMaker.query(conditions);
-  },
-
   async invokeMethod(
     method: string,
     roomName: string,
     clientOptions: matchMaker.ClientOptions = {},
-    authOptions?: matchMaker.AuthOptions,
+    authOptions?: AuthContext,
   ) {
     if (this.exposedMethods.indexOf(method) === -1) {
       throw new ServerError(ErrorCode.MATCHMAKE_NO_HANDLER, `invalid method "${method}"`);

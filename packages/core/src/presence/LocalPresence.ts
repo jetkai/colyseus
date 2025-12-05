@@ -1,26 +1,25 @@
-import fs from "fs";
-import path from "path";
+import fs from 'fs';
+import path from 'path';
 
 import { EventEmitter } from 'events';
-import { spliceOne } from '../utils/Utils';
-import { Presence } from './Presence';
+import { spliceOne } from '../utils/Utils.js';
+import { Presence } from './Presence.js';
 
-import { isDevMode } from '../utils/DevMode';
+import { isDevMode } from '../utils/DevMode.js';
 
 type Callback = (...args: any[]) => void;
 
 const DEVMODE_CACHE_FILE_PATH = path.resolve(".devmode.json");
 
 export class LocalPresence implements Presence {
-    public channels = new EventEmitter();
+    public subscriptions = new EventEmitter();
 
     public data: {[roomName: string]: string[]} = {};
     public hash: {[roomName: string]: {[key: string]: string}} = {};
 
     public keys: {[name: string]: string | number} = {};
 
-    protected subscriptions: {[id: string]: Callback[]} = {};
-    private timeouts: {[name: string]: NodeJS.Timer} = {};
+    private timeouts: {[name: string]: NodeJS.Timeout} = {};
 
     constructor() {
       //
@@ -39,44 +38,52 @@ export class LocalPresence implements Presence {
     }
 
     public subscribe(topic: string, callback: (...args: any[]) => void) {
-        if (!this.subscriptions[topic]) { this.subscriptions[topic] = []; }
-        this.subscriptions[topic].push(callback);
-        this.channels.on(topic, callback);
-        return this;
+        this.subscriptions.on(topic, callback);
+        return Promise.resolve(this);
     }
 
     public unsubscribe(topic: string, callback?: Callback) {
-        const topicCallbacks = this.subscriptions[topic];
-        if (!topicCallbacks) { return; }
-
         if (callback)  {
-            const idx = topicCallbacks.indexOf(callback);
-            if (idx !== -1) {
-                topicCallbacks.splice(idx, 1);
-                this.channels.removeListener(topic, callback);
-            }
-
-            if (topicCallbacks.length === 0) {
-                delete this.subscriptions[topic];
-            }
+            this.subscriptions.removeListener(topic, callback);
 
         } else {
-          topicCallbacks.forEach((cb) =>
-            this.channels.removeListener(topic, cb));
-
-          delete this.subscriptions[topic];
+            this.subscriptions.removeAllListeners(topic);
         }
 
         return this;
     }
 
     public publish(topic: string, data: any) {
-        this.channels.emit(topic, data);
+        this.subscriptions.emit(topic, data);
         return this;
     }
 
+    public async channels (pattern?: string) {
+      let eventNames = this.subscriptions.eventNames() as string[];
+      if (pattern) {
+        //
+        // This is a limited glob pattern to regexp implementation.
+        // If needed, we can use a full implementation like picomatch: https://github.com/micromatch/picomatch/
+        //
+        const regexp = new RegExp(
+          pattern.
+            replaceAll(".", "\\.").
+            replaceAll("$", "\\$").
+            replaceAll("*", ".*").
+            replaceAll("?", "."),
+          "gi"
+        );
+        eventNames = eventNames.filter((eventName) => regexp.test(eventName));
+      }
+      return eventNames;
+    }
+
     public async exists(key: string): Promise<boolean> {
-        return this.channels.listenerCount(key) > 0;
+        return (
+          this.keys[key] !== undefined ||
+          this.data[key] !== undefined ||
+          this.hash[key] !== undefined
+        );
     }
 
     public set(key: string, value: string) {
@@ -84,12 +91,15 @@ export class LocalPresence implements Presence {
     }
 
     public setex(key: string, value: string, seconds: number) {
+        this.keys[key] = value;
+        this.expire(key, seconds);
+    }
+
+    public expire(key: string, seconds: number) {
         // ensure previous timeout is clear before setting another one.
         if (this.timeouts[key]) {
             clearTimeout(this.timeouts[key]);
         }
-
-        this.keys[key] = value;
         this.timeouts[key] = setTimeout(() => {
             delete this.keys[key];
             delete this.timeouts[key];
@@ -158,6 +168,7 @@ export class LocalPresence implements Presence {
     public hset(key: string, field: string, value: string) {
         if (!this.hash[key]) { this.hash[key] = {}; }
         this.hash[key][field] = value;
+        return Promise.resolve(true);
     }
 
     public hincrby(key: string, field: string, incrBy: number) {
@@ -165,11 +176,34 @@ export class LocalPresence implements Presence {
         let value = Number(this.hash[key][field] || '0');
         value += incrBy;
         this.hash[key][field] = value.toString();
-        return value;
+        return Promise.resolve(value);
+    }
+
+    public hincrbyex(key: string, field: string, incrBy: number, expireInSeconds: number) {
+        if (!this.hash[key]) { this.hash[key] = {}; }
+        let value = Number(this.hash[key][field] || '0');
+        value += incrBy;
+        this.hash[key][field] = value.toString();
+
+        //
+        // FIXME: delete only hash[key][field]
+        // (we can't use "HEXPIRE" in Redis because it's only available since Redis version 7.4.0+)
+        //
+        if (this.timeouts[key]) {
+          clearTimeout(this.timeouts[key]);
+        }
+        this.timeouts[key] = setTimeout(() => {
+            delete this.hash[key];
+            delete this.timeouts[key];
+        }, expireInSeconds * 1000);
+
+        return Promise.resolve(value);
     }
 
     public async hget(key: string, field: string) {
-        return this.hash[key] && this.hash[key][field];
+        return (typeof(this.hash[key]) === 'object')
+          ? this.hash[key][field] ?? null
+          : null;
     }
 
     public async hgetall(key: string) {
@@ -181,7 +215,7 @@ export class LocalPresence implements Presence {
         if (success) {
             delete this.hash[key][field];
         }
-        return success;
+        return Promise.resolve(success);
     }
 
     public async hlen(key: string) {
@@ -202,6 +236,91 @@ export class LocalPresence implements Presence {
         }
         (this.keys[key] as number)--;
         return Promise.resolve(this.keys[key] as number);
+    }
+
+    public llen(key: string) {
+      return Promise.resolve((this.data[key] && this.data[key].length) || 0);
+    }
+
+    public rpush(key: string, ...values: string[]): Promise<number> {
+      if (!this.data[key]) { this.data[key] = []; }
+
+      let lastLength: number = 0;
+
+      values.forEach(value => {
+        lastLength = this.data[key].push(value);
+      });
+
+      return Promise.resolve(lastLength);
+    }
+
+    public lpush(key: string, ...values: string[]): Promise<number> {
+      if (!this.data[key]) { this.data[key] = []; }
+
+      let lastLength: number = 0;
+
+      values.forEach(value => {
+        lastLength = this.data[key].unshift(value);
+      });
+
+      return Promise.resolve(lastLength);
+    }
+
+    public lpop(key: string): Promise<string> {
+      return Promise.resolve(Array.isArray(this.data[key])
+        ? this.data[key].shift()
+        : null);
+    }
+
+    public rpop(key: string): Promise<string | null> {
+      return Promise.resolve(this.data[key].pop());
+    }
+
+    public brpop(...args: [...keys: string[], timeoutInSeconds: number]): Promise<[string, string] | null> {
+      const keys = args.slice(0, -1) as string[];
+      const timeoutInSeconds = args[args.length - 1] as number;
+
+      const getFirstPopulated = (): [string, string] | null => {
+        const keyWithValue = keys.find(key => this.data[key] && this.data[key].length > 0);
+        if (keyWithValue) {
+          return [keyWithValue, this.data[keyWithValue].pop()];
+        } else {
+          return null;
+        }
+      }
+
+      const firstPopulated = getFirstPopulated();
+
+      if (firstPopulated) {
+        // return first populated key + item
+        return Promise.resolve(firstPopulated);
+
+      } else {
+        // 8 retries per second
+        const maxRetries = timeoutInSeconds * 8;
+
+        let tries = 0;
+        return new Promise((resolve) => {
+          const interval = setInterval(() => {
+            tries++;
+
+            const firstPopulated = getFirstPopulated();
+            if (firstPopulated) {
+              clearInterval(interval);
+              return resolve(firstPopulated);
+
+            } else if (tries >= maxRetries) {
+              clearInterval(interval);
+              return resolve(null);
+            }
+
+          }, (timeoutInSeconds * 1000) / maxRetries);
+        });
+      }
+    }
+
+    public setMaxListeners(number: number) {
+      this.subscriptions.setMaxListeners(number);
     }
 
     public shutdown() {

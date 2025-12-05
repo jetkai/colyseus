@@ -1,5 +1,6 @@
 import Redis, { Cluster, ClusterNode, ClusterOptions, RedisOptions } from 'ioredis';
 import { Presence } from '@colyseus/core';
+import EventEmitter from 'events';
 
 type Callback = (...args: any[]) => void;
 
@@ -7,7 +8,7 @@ export class RedisPresence implements Presence {
     protected sub: Redis | Cluster;
     protected pub: Redis | Cluster;
 
-    protected subscriptions: { [channel: string]: Callback[] } = {};
+    protected subscriptions = new EventEmitter();
 
     constructor(options?: number | string | RedisOptions | ClusterNode[], clusterOptions?: ClusterOptions) {
         if (Array.isArray(options)) {
@@ -24,11 +25,7 @@ export class RedisPresence implements Presence {
     }
 
     public async subscribe(topic: string, callback: Callback) {
-        if (!this.subscriptions[topic]) {
-          this.subscriptions[topic] = [];
-        }
-
-        this.subscriptions[topic].push(callback);
+        this.subscriptions.addListener(topic, callback);
 
         if (this.sub.listeners('message').length === 0) {
           this.sub.on('message', this.handleSubscription);
@@ -40,19 +37,14 @@ export class RedisPresence implements Presence {
     }
 
     public async unsubscribe(topic: string, callback?: Callback) {
-        const topicCallbacks = this.subscriptions[topic];
-        if (!topicCallbacks) { return; }
-
         if (callback) {
-          const index = topicCallbacks.indexOf(callback);
-          topicCallbacks.splice(index, 1);
+          this.subscriptions.removeListener(topic, callback);
 
         } else {
-          this.subscriptions[topic] = [];
+          this.subscriptions.removeAllListeners(topic);
         }
 
-        if (this.subscriptions[topic].length === 0) {
-          delete this.subscriptions[topic];
+        if (this.subscriptions.listenerCount(topic) === 0) {
           await this.sub.unsubscribe(topic);
         }
 
@@ -67,8 +59,12 @@ export class RedisPresence implements Presence {
         await this.pub.publish(topic, JSON.stringify(data));
     }
 
-    public async exists(roomId: string): Promise<boolean> {
-        return (await (this.pub as any).pubsub("channels", roomId)).length > 0;
+    public channels(pattern: string = '*') {
+      return this.pub.pubsub("CHANNELS", pattern) as Promise<string[]>;
+    }
+
+    public async exists(key: string): Promise<boolean> {
+        return (await this.pub.exists(key)) === 1;
     }
 
     public async set(key: string, value: string) {
@@ -79,6 +75,11 @@ export class RedisPresence implements Presence {
     public async setex(key: string, value: string, seconds: number) {
       return new Promise((resolve) =>
         this.pub.setex(key, seconds, value, resolve));
+    }
+
+    public async expire(key: string, seconds: number) {
+      return new Promise((resolve) =>
+        this.pub.expire(key, seconds, resolve));
     }
 
     public async get(key: string) {
@@ -123,7 +124,7 @@ export class RedisPresence implements Presence {
     }
 
     public async hset(key: string, field: string, value: string) {
-        return await this.pub.hset(key, field, value);
+        return (await this.pub.hset(key, field, value)) > 0;
     }
 
     public async hincrby(key: string, field: string, value: number) {
@@ -132,6 +133,18 @@ export class RedisPresence implements Presence {
             if (err) return reject(err);
             resolve(result);
           });
+        });
+    }
+
+    public async hincrbyex(key: string, field: string, value: number, expireInSeconds: number) {
+        return new Promise<number>((resolve, reject) => {
+          this.pub.multi()
+            .hincrby(key, field, value)
+            .expire(key, expireInSeconds)
+            .exec((err, results) => {
+              if (err) return reject(err);
+              resolve(results[0][1] as number);
+            });
         });
     }
 
@@ -159,17 +172,41 @@ export class RedisPresence implements Presence {
         return await this.pub.decr(key);
     }
 
+    public async llen(key: string): Promise<number> {
+      return await this.pub.llen(key);
+    }
+
+    public async rpush(key: string, value: string): Promise<number> {
+      return await this.pub.rpush(key, value);
+    }
+
+    public async lpush(key: string, value: string): Promise<number> {
+      return await this.pub.lpush(key, value);
+    }
+
+    public async rpop(key: string): Promise<string | null> {
+      return await this.pub.rpop(key);
+    }
+
+    public async lpop(key: string): Promise<string | null> {
+      return await this.pub.lpop(key);
+    }
+
+    public async brpop(...args: [...keys: string[], timeoutInSeconds: number]): Promise<[string, string] | null> {
+      return await this.pub.brpop.apply(this.pub, args);
+    }
+
     public shutdown() {
         this.sub.quit();
         this.pub.quit();
     }
 
+    public setMaxListeners(number: number) {
+      this.subscriptions.setMaxListeners(number);
+    }
+
     protected handleSubscription = (channel, message) => {
-        if (this.subscriptions[channel]) {
-          for (let i = 0, l = this.subscriptions[channel].length; i < l; i++) {
-            this.subscriptions[channel][i](JSON.parse(message));
-          }
-        }
+        this.subscriptions.emit(channel, JSON.parse(message));
     }
 
 }

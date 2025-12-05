@@ -39,24 +39,26 @@ Room.prototype.waitForNextMessage = async function(this: Room, additionalDelay: 
 }
 
 Room.prototype.waitForMessage = async function(this: Room, type: string, rejectTimeout: number = 3000) {
-  const originalMessageHandler = this['onMessageHandlers'][type] || (() => {});
+  const originalMessageHandler = this['onMessageHandlers'][type] || { callback: () => { } };
   const room = this;
 
   return new Promise<[Client, any]>((resolve, reject) => {
     const rejectionTimeout = setTimeout(() => reject(new Error(`message '${type}' was not called. timed out (${rejectTimeout}ms)`)), rejectTimeout);
 
-    room['onMessageHandlers'][type] = async function (client, message) {
-      // clear rejection timeout
-      clearTimeout(rejectionTimeout);
+    room['onMessageHandlers'][type] = {
+      callback: async function (client, message) {
+        // clear rejection timeout
+        clearTimeout(rejectionTimeout);
 
-      // call original handler
-      await originalMessageHandler.apply(room, arguments);
+        // call original handler
+        await originalMessageHandler.callback.apply(room, arguments);
 
-      // revert to original message handler
-      room['onMessageHandlers'][type] = originalMessageHandler;
+        // revert to original message handler
+        room['onMessageHandlers'][type] = originalMessageHandler;
 
-      // resolves waitForMessage promise.
-      resolve([client, message]);
+        // resolves waitForMessage promise.
+        resolve([client, message]);
+      }
     }
   });
 }
@@ -67,7 +69,7 @@ Room.prototype.waitForMessage = async function(this: Room, type: string, rejectT
 Room.prototype.waitForNextSimulationTick = async function(this: Room) {
   if (this['_simulationInterval']) {
     const milliseconds = this['_simulationInterval']['_idleTimeout'];
-    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+    return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
     // return timers.setTimeout(milliseconds);
 
   } else {

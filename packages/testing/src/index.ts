@@ -1,8 +1,8 @@
-import "./Room.ext";
+import './Room.ext.js';
 
 import { Server } from "@colyseus/core";
 import { ConfigOptions, listen } from "@colyseus/tools";
-import { ColyseusTestServer } from "./TestServer";
+import { ColyseusTestServer } from './TestServer.js';
 
 const DEFAULT_TEST_PORT = 2568;
 
@@ -16,6 +16,7 @@ export async function boot(config: ConfigOptions | Server, port: number = DEFAUL
     if (!config.options) { config.options = {}; }
 
     // override server options for testing.
+    config.options.devMode = false;
     config.options.greet = false;
     config.options.gracefullyShutdown = false;
 

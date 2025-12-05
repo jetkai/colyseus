@@ -101,12 +101,12 @@ describe("Presence", () => {
         assert.deepEqual([1, 2, 3, 4], messages);
 
         // leave all subscriptions...
-        assert.ok(presence['subscriptions']['topic-collide1']);
-        assert.ok(presence['subscriptions']['topic-collide2']);
+        assert.ok(presence['subscriptions'].listenerCount("topic-collide1") > 0);
+        assert.ok(presence['subscriptions'].listenerCount("topic-collide2") > 0);
         await presence.unsubscribe("topic-collide1", callback1);
         await presence.unsubscribe("topic-collide2", callback3);
-        assert.equal(undefined, presence['subscriptions']['topic-collide1']);
-        assert.equal(undefined, presence['subscriptions']['topic-collide2']);
+        assert.strictEqual(0, presence['subscriptions'].listenerCount("topic-collide1"));
+        assert.strictEqual(0, presence['subscriptions'].listenerCount("topic-collide2"));
 
         messages = [];
         await presence.publish("topic-collide1", 1000);
@@ -123,10 +123,47 @@ describe("Presence", () => {
         assert.ok(true);
       });
 
+      it("unsubscribe from non-existing callback", async () => {
+        let callCount = 0;
+        await presence.subscribe("topic", (_) => { callCount++; });
+        await presence.unsubscribe("topic", function() {});
+        await presence.publish("topic", "hello world!");
+        await timeout(10);
+        assert.strictEqual(1, callCount);
+      });
+
+      it("unsubscribe while triggering", async () => {
+        const topic = "unsubscribe-ongoing";
+
+        let calls = [];
+
+        const one = (_) => calls.push("one");
+        const two = (_) => calls.push("two");
+        const three = (_) => calls.push("three");
+        const four = (_) => calls.push("four");
+
+        await presence.subscribe(topic, one);
+        await presence.subscribe(topic, two);
+        await presence.subscribe(topic, async () => {
+          await presence.unsubscribe(topic, four);
+
+        });
+        await presence.subscribe(topic, three);
+        await presence.subscribe(topic, four);
+
+        await presence.publish(topic, {});
+        await timeout(10);
+
+        assert.deepStrictEqual(["one", "two", "three", "four"], calls);
+      });
+
       it("exists", async () => {
-        await presence.subscribe("exists1", () => {});
+        await presence.set("exists1", "hello world");
         assert.equal(true, await presence.exists("exists1"));
         assert.equal(false, await presence.exists("exists2"));
+
+        await presence.del("exists1");
+        assert.equal(false, await presence.exists("exists1"));
       });
 
       it("set", async () => {
@@ -263,6 +300,70 @@ describe("Presence", () => {
         assert.strictEqual(3, hincrby);
 
         assert.strictEqual('3', await presence.hget("hincrby", "one"));
+      });
+
+      it("channels", async () => {
+        await presence.subscribe("p:one", () => {});
+        await presence.subscribe("$one", () => {});
+        await presence.subscribe("p:two", () => {});
+        await presence.subscribe("$two", () => {});
+        await presence.subscribe("one.two", () => {});
+
+        const channels = await presence.channels();
+        assert.deepStrictEqual(["p:one", "$one", "p:two", "$two", "one.two"].sort(), channels.sort());
+
+        const pChannels = await presence.channels("p:*");
+        assert.deepStrictEqual(["p:one", "p:two"], pChannels.sort());
+
+        const $Channels = await presence.channels("$*");
+        assert.deepStrictEqual(["$one", "$two"], $Channels.sort());
+
+        const dotChannels = await presence.channels("*.*");
+        assert.deepStrictEqual(["one.two"], dotChannels.sort());
+      });
+
+      describe("brpop", () => {
+        it("brpop should return existing item", async () => {
+          await presence.lpush("brpop", "one", "two", "three");
+          const result = await presence.brpop("brpop", 1);
+          assert.deepStrictEqual(["brpop", "one"], result);
+        });
+
+        it("brpop should return new item", async () => {
+          let result: string[] = undefined;
+          presence.brpop("brpop", 1).then((r) => {
+            result = r;
+          }).catch((e) => {
+            result = null;
+          });
+
+          await presence.lpush("brpop", "one", "two", "three");
+
+          await timeout(200);
+          assert.deepStrictEqual(["brpop", "one"], result);
+        });
+
+        it("brpop should return null if no item is available", async () => {
+          const result = await presence.brpop("none", 0.1);
+          assert.deepStrictEqual(null, result);
+        });
+
+      });
+
+      describe("hincrbyex", () => {
+        it("hincrbyex should increment the value", async () => {
+          const value1 = await presence.hincrbyex("hincrbyex", "one", 1, 1);
+          assert.strictEqual(1, value1);
+          assert.strictEqual("1", await presence.hget("hincrbyex", "one"));
+        });
+
+        it("hincrbyex should expire the key after the given time", async () => {
+          await presence.hincrbyex("hincrbyex", "expired", 1, 1);
+          assert.strictEqual("1", await presence.hget("hincrbyex", "expired"));
+          await timeout(1200);
+          assert.strictEqual(null, await presence.hget("hincrbyex", "expired"));
+        });
+
       });
 
     });
