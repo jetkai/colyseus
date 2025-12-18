@@ -1,7 +1,14 @@
 packages:
-  - 'bundles/*'
-  - 'packages/*'
-  - 'packages/drivers/*'
-  - 'packages/transport/*'
-  - 'packages/presence/*'
-  - 'packages/serializer/*'
+  - bundles/*
+  - packages/*
+  - packages/drivers/*
+  - packages/transport/*
+  - packages/presence/*
+  - packages/serializer/*
+
+onlyBuiltDependencies:
+  - '@fails-components/webtransport-transport-http3-quiche'
+  - '@parcel/watcher'
+  - esbuild
+  - msgpackr-extract
+  - nx
